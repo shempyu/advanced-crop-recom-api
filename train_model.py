@@ -1,15 +1,10 @@
-# ============================================================
-# SMART CROP AI - TRAINING SCRIPT
-# ============================================================
-
 import warnings
 warnings.filterwarnings('ignore')
 
+import os
+import joblib
 import numpy as np
 import pandas as pd
-import tensorflow as tf
-import joblib
-import os
 
 from sklearn.preprocessing import (
     MinMaxScaler,
@@ -22,26 +17,9 @@ from sklearn.ensemble import (
 )
 
 from sklearn.tree import DecisionTreeClassifier
-
 from sklearn.naive_bayes import GaussianNB
 
-from sklearn.metrics import accuracy_score
-
-from tensorflow.keras.models import Model
-
-from tensorflow.keras.layers import (
-    Input,
-    LSTM,
-    Bidirectional,
-    Conv1D,
-    BatchNormalization,
-    GlobalAveragePooling1D,
-    Dense,
-    Dropout,
-    Add
-)
-
-from tensorflow.keras.callbacks import EarlyStopping
+from xgboost import XGBRegressor
 
 # ============================================================
 # CREATE MODELS DIRECTORY
@@ -55,55 +33,26 @@ os.makedirs("models", exist_ok=True)
 
 print("\nLoading datasets...\n")
 
-weather_data = pd.read_csv(
-    "DATA SET2 (1).csv",
-    skiprows=5
+weather_df = pd.read_csv(
+    "DATA_SET2.csv",
+    skiprows=5,
+    header=None
 )
 
-crop_data = pd.read_csv(
+crop_df = pd.read_csv(
     "croprecommendationml.csv"
 )
 
 # ============================================================
-# CLEAN COLUMN NAMES
+# WEATHER DATA CLEANING
 # ============================================================
 
-weather_data.columns = (
-    weather_data.columns
-    .str.strip()
-    .str.lower()
-)
+weather_df = weather_df.iloc[:, :8]
 
-crop_data.columns = (
-    crop_data.columns
-    .str.strip()
-    .str.lower()
-)
-
-# ============================================================
-# CLEAN WEATHER DATA
-# ============================================================
-
-weather_data['district'] = (
-    weather_data['district']
-    .astype(str)
-    .str.strip()
-    .str.lower()
-)
-
-weather_data['month'] = (
-    weather_data['month']
-    .astype(str)
-    .str.strip()
-    .str.lower()
-)
-
-# ============================================================
-# NUMERIC CONVERSION
-# ============================================================
-
-numeric_cols = [
+weather_df.columns = [
+    'district',
     'year',
+    'month',
     'pre_sum',
     'qv2m',
     't2m',
@@ -111,116 +60,226 @@ numeric_cols = [
     't2m_min'
 ]
 
-for col in numeric_cols:
+weather_df = weather_df.replace('ANN', np.nan)
 
-    weather_data[col] = pd.to_numeric(
-        weather_data[col],
+weather_df = weather_df[
+    weather_df['district'] != 'District'
+]
+
+weather_df['district'] = (
+    weather_df['district']
+    .astype(str)
+    .str.strip()
+)
+
+weather_df['month'] = (
+    weather_df['month']
+    .astype(str)
+    .str.strip()
+)
+
+FEATURES = [
+    'pre_sum',
+    'qv2m',
+    't2m',
+    't2m_max',
+    't2m_min'
+]
+
+for col in FEATURES:
+
+    weather_df[col] = pd.to_numeric(
+        weather_df[col],
         errors='coerce'
     )
 
-weather_data.dropna(inplace=True)
+weather_df['year'] = pd.to_numeric(
+    weather_df['year'],
+    errors='coerce'
+)
+
+weather_df = weather_df.dropna().reset_index(drop=True)
 
 # ============================================================
 # LOG TRANSFORM RAINFALL
 # ============================================================
 
-weather_data['pre_sum'] = np.log1p(
-    weather_data['pre_sum']
+weather_df['pre_sum'] = np.log1p(
+    weather_df['pre_sum']
 )
 
 # ============================================================
-# HUMIDITY CONVERSION
+# MONTH NUMBER
 # ============================================================
 
-def convert_qv2m_to_rh(
-    q,
-    temp_c,
-    pressure=1013.25
+month_map = {
+    'January': 1,
+    'February': 2,
+    'March': 3,
+    'April': 4,
+    'May': 5,
+    'June': 6,
+    'July': 7,
+    'August': 8,
+    'September': 9,
+    'October': 10,
+    'November': 11,
+    'December': 12
+}
+
+weather_df['month_num'] = (
+    weather_df['month'].map(month_map)
+)
+
+# ============================================================
+# SORT DATA
+# ============================================================
+
+weather_df = weather_df.sort_values(
+    ['district', 'year', 'month_num']
+).reset_index(drop=True)
+
+print("Weather Data Shape :", weather_df.shape)
+
+# ============================================================
+# WEATHER SCALER
+# ============================================================
+
+weather_scaler = MinMaxScaler()
+
+weather_df[FEATURES] = (
+    weather_scaler.fit_transform(
+        weather_df[FEATURES]
+    )
+)
+
+# Save scaler
+joblib.dump(
+    weather_scaler,
+    "models/weather_scaler.pkl"
+)
+
+# Save processed dataframe
+weather_df.to_pickle(
+    "models/processed_weather_df.pkl"
+)
+
+# ============================================================
+# CREATE WEATHER SEQUENCES
+# ============================================================
+
+def create_weather_sequences(
+    data,
+    input_steps=12
 ):
 
-    if q > 1:
-        q = q / 1000
+    X = []
+    y = []
 
-    q = max(q, 1e-6)
+    for district in data['district'].unique():
 
-    e = (
-        q * pressure
-    ) / (
-        0.622 + 0.378 * q
+        d_data = data[
+            data['district'] == district
+        ][FEATURES].values
+
+        if len(d_data) <= input_steps:
+            continue
+
+        for i in range(
+            len(d_data) - input_steps
+        ):
+
+            seq_x = d_data[
+                i:i+input_steps
+            ].flatten()
+
+            seq_y = d_data[
+                i+input_steps
+            ]
+
+            X.append(seq_x)
+            y.append(seq_y)
+
+    return np.array(X), np.array(y)
+
+X_weather, y_weather = (
+    create_weather_sequences(
+        weather_df
     )
-
-    es = 6.112 * np.exp(
-        (17.67 * temp_c) /
-        (temp_c + 243.5)
-    )
-
-    rh = (e / es) * 100
-
-    return np.clip(rh, 10, 100)
-
-weather_data['humidity'] = weather_data.apply(
-
-    lambda row: convert_qv2m_to_rh(
-        row['qv2m'],
-        row['t2m']
-    ),
-
-    axis=1
 )
 
+print("\nWeather X Shape :", X_weather.shape)
+print("Weather y Shape :", y_weather.shape)
+
 # ============================================================
-# LABEL ENCODING
+# TRAIN XGBOOST WEATHER MODELS
 # ============================================================
 
-le_district = LabelEncoder()
-le_month = LabelEncoder()
+print("\nTraining XGBoost Weather Models...\n")
+
+weather_models = {}
+
+for i, feature in enumerate(FEATURES):
+
+    print(f"Training {feature} model...")
+
+    model = XGBRegressor(
+
+        n_estimators=300,
+
+        learning_rate=0.05,
+
+        max_depth=6,
+
+        subsample=0.8,
+
+        colsample_bytree=0.8,
+
+        objective='reg:squarederror',
+
+        random_state=42,
+
+        n_jobs=-1
+    )
+
+    model.fit(
+        X_weather,
+        y_weather[:, i]
+    )
+
+    weather_models[feature] = model
+
+    model.save_model(
+        f"models/xgb_{feature}.json"
+    )
+
+    print(f"Saved xgb_{feature}.json")
+
+# ============================================================
+# CROP DATA CLEANING
+# ============================================================
+
+crop_df.columns = (
+    crop_df.columns
+    .str.strip()
+    .str.lower()
+)
+
 le_crop = LabelEncoder()
 
-weather_data['district_enc'] = (
-    le_district.fit_transform(
-        weather_data['district']
-    )
-)
-
-weather_data['month_enc'] = (
-    le_month.fit_transform(
-        weather_data['month']
-    )
-)
-
-crop_data['label_enc'] = (
+crop_df['label_enc'] = (
     le_crop.fit_transform(
-        crop_data['label']
+        crop_df['label']
     )
-)
-
-# ============================================================
-# FEATURE SCALERS
-# ============================================================
-
-climate_scaler = MinMaxScaler()
-
-basic_crop_scaler = MinMaxScaler()
-
-advanced_crop_scaler = MinMaxScaler()
-
-# ============================================================
-# WEATHER FEATURES
-# ============================================================
-
-X_climate = weather_data[
-    ['district_enc', 'month_enc', 'year']
-]
-
-X_climate_scaled = climate_scaler.fit_transform(
-    X_climate
 )
 
 # ============================================================
 # BASIC CROP FEATURES
 # ============================================================
 
-X_crop_basic = crop_data[
+basic_crop_scaler = MinMaxScaler()
+
+X_crop_basic = crop_df[
     [
         'temperature',
         'humidity',
@@ -238,7 +297,9 @@ X_crop_basic_scaled = (
 # ADVANCED CROP FEATURES
 # ============================================================
 
-X_crop_advanced = crop_data[
+advanced_crop_scaler = MinMaxScaler()
+
+X_crop_advanced = crop_df[
     [
         'temperature',
         'humidity',
@@ -256,139 +317,7 @@ X_crop_advanced_scaled = (
     )
 )
 
-# ============================================================
-# RESHAPE FOR DL
-# ============================================================
-
-X_climate_lstm = X_climate_scaled.reshape(
-    X_climate_scaled.shape[0],
-    X_climate_scaled.shape[1],
-    1
-)
-
-# ============================================================
-# TARGETS
-# ============================================================
-
-y_temp = weather_data['t2m'].values
-
-y_hum = weather_data['humidity'].values
-
-y_rain = weather_data['pre_sum'].values
-
-y_crop = crop_data['label_enc']
-
-# ============================================================
-# WEATHER MODEL
-# ============================================================
-
-def build_weather_model():
-
-    inputs = Input(
-        shape=(
-            X_climate_lstm.shape[1],
-            1
-        )
-    )
-
-    x1 = Bidirectional(
-        LSTM(
-            64,
-            return_sequences=True
-        )
-    )(inputs)
-
-    x1 = Dropout(0.2)(x1)
-
-    x2 = LSTM(
-        64,
-        return_sequences=True
-    )(x1)
-
-    x2 = Dropout(0.2)(x2)
-
-    x3 = Conv1D(
-        filters=64,
-        kernel_size=3,
-        padding='causal',
-        activation='relu'
-    )(x2)
-
-    x3 = BatchNormalization()(x3)
-
-    x4 = Add()([x2, x3])
-
-    x5 = GlobalAveragePooling1D()(x4)
-
-    x5 = Dense(
-        128,
-        activation='relu'
-    )(x5)
-
-    x5 = Dropout(0.3)(x5)
-
-    x5 = Dense(
-        64,
-        activation='relu'
-    )(x5)
-
-    outputs = Dense(1)(x5)
-
-    model = Model(
-        inputs,
-        outputs
-    )
-
-    model.compile(
-        optimizer='adam',
-        loss='huber',
-        metrics=['mae']
-    )
-
-    return model
-
-# ============================================================
-# TRAIN WEATHER MODELS
-# ============================================================
-
-print("\nTraining Weather Models...\n")
-
-temp_model = build_weather_model()
-hum_model = build_weather_model()
-rain_model = build_weather_model()
-
-early_stop = EarlyStopping(
-    monitor='loss',
-    patience=5,
-    restore_best_weights=True
-)
-
-temp_model.fit(
-    X_climate_lstm,
-    y_temp,
-    epochs=20,
-    batch_size=32,
-    verbose=1,
-    callbacks=[early_stop]
-)
-
-hum_model.fit(
-    X_climate_lstm,
-    y_hum,
-    epochs=20,
-    batch_size=32,
-    verbose=1,
-    callbacks=[early_stop]
-)
-
-rain_model.fit(
-    X_climate_lstm,
-    y_rain,
-    epochs=20,
-    batch_size=32,
-    verbose=1,
-    callbacks=[early_stop]
-)
+y_crop = crop_df['label_enc']
 
 # ============================================================
 # BASIC CROP MODEL
@@ -402,6 +331,7 @@ basic_crop_model = VotingClassifier(
 
         (
             'dt',
+
             DecisionTreeClassifier(
                 max_depth=10,
                 random_state=42
@@ -415,12 +345,12 @@ basic_crop_model = VotingClassifier(
 
         (
             'rf',
+
             RandomForestClassifier(
                 n_estimators=200,
                 random_state=42
             )
         )
-
     ],
 
     voting='soft'
@@ -443,6 +373,7 @@ advanced_crop_model = VotingClassifier(
 
         (
             'dt',
+
             DecisionTreeClassifier(
                 max_depth=10,
                 random_state=42
@@ -456,12 +387,12 @@ advanced_crop_model = VotingClassifier(
 
         (
             'rf',
+
             RandomForestClassifier(
                 n_estimators=300,
                 random_state=42
             )
         )
-
     ],
 
     voting='soft'
@@ -473,22 +404,8 @@ advanced_crop_model.fit(
 )
 
 # ============================================================
-# SAVE MODELS
+# SAVE CROP MODELS
 # ============================================================
-
-print("\nSaving models...\n")
-
-temp_model.save(
-    "models/temp_model.keras"
-)
-
-hum_model.save(
-    "models/hum_model.keras"
-)
-
-rain_model.save(
-    "models/rain_model.keras"
-)
 
 joblib.dump(
     basic_crop_model,
@@ -498,11 +415,6 @@ joblib.dump(
 joblib.dump(
     advanced_crop_model,
     "models/advanced_crop_model.pkl"
-)
-
-joblib.dump(
-    climate_scaler,
-    "models/climate_scaler.pkl"
 )
 
 joblib.dump(
@@ -516,18 +428,8 @@ joblib.dump(
 )
 
 joblib.dump(
-    le_district,
-    "models/le_district.pkl"
-)
-
-joblib.dump(
-    le_month,
-    "models/le_month.pkl"
-)
-
-joblib.dump(
     le_crop,
     "models/le_crop.pkl"
 )
 
-print("\nAll models saved successfully!")
+print("\n✅ ALL MODELS SAVED SUCCESSFULLY!")
